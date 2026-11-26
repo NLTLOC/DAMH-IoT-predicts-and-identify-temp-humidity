@@ -38,12 +38,6 @@
     label, data: [], yAxisID: axis, borderColor: color, backgroundColor: color,
     borderWidth: 2.2, pointRadius: 0, pointHoverRadius: 4, tension: 0.3, ...extra,
   });
-  const band = (color, fill) => ({
-    label: "_band", data: [], yAxisID: color === COLORS.temp ? "yT" : "yH",
-    borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, tension: 0.3,
-    backgroundColor: color + "26", fill,
-  });
-
   function buildChart() {
     chart = new Chart($("#chart"), {
       type: "line",
@@ -51,10 +45,8 @@
         datasets: [
           line("Nhiệt độ (°C)", COLORS.temp, "yT"),
           line("Dự báo nhiệt độ", COLORS.temp, "yT", { borderDash: [6, 5] }),
-          band(COLORS.temp, "+1"), band(COLORS.temp, false),
           line("Độ ẩm (%)", COLORS.hum, "yH"),
           line("Dự báo độ ẩm", COLORS.hum, "yH", { borderDash: [6, 5] }),
-          band(COLORS.hum, "+1"), band(COLORS.hum, false),
         ],
       },
       options: {
@@ -78,9 +70,8 @@
         },
         plugins: {
           forecastZone: { now: null },
-          legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8, filter: (i) => i.text !== "_band" } },
+          legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8 } },
           tooltip: {
-            filter: (i) => i.dataset.label !== "_band",
             callbacks: {
               title: (items) => hhmm(items[0].parsed.x),
               label: (i) => `${i.dataset.label}: ${num(i.parsed.y)}`,
@@ -97,20 +88,13 @@
     const pts = (key) => d.history.map((p) => ({ x: p.t, y: p[key] }));
     const anchor = d.latest ? { t: d.latest.t, temperature: d.latest.temperature, humidity: d.latest.humidity } : null;
     const fc = d.forecast.points;
-    const fcLine = (key, lo, hi) => {
-      if (!fc.length || !anchor) return [[], [], []];
-      const at = (m) => now + m * 60000;
-      return [
-        [{ x: anchor.t, y: anchor[key] }, ...fc.map((p) => ({ x: at(p.minutes_ahead), y: p[key] }))],
-        [{ x: anchor.t, y: anchor[key] }, ...fc.map((p) => ({ x: at(p.minutes_ahead), y: p[hi] }))],
-        [{ x: anchor.t, y: anchor[key] }, ...fc.map((p) => ({ x: at(p.minutes_ahead), y: p[lo] }))],
-      ];
-    };
-    const [tF, tU, tL] = fcLine("temperature", "temp_low", "temp_high");
-    const [hF, hU, hL] = fcLine("humidity", "hum_low", "hum_high");
+    const fcLine = (key) => (!fc.length || !anchor ? [] : [
+      { x: anchor.t, y: anchor[key] },
+      ...fc.map((p) => ({ x: p.t, y: p[key] })),
+    ]);
     const ds = chart.data.datasets;
-    ds[0].data = pts("temperature"); ds[1].data = tF; ds[2].data = tU; ds[3].data = tL;
-    ds[4].data = pts("humidity");    ds[5].data = hF; ds[6].data = hU; ds[7].data = hL;
+    ds[0].data = pts("temperature"); ds[1].data = fcLine("temperature");
+    ds[2].data = pts("humidity");    ds[3].data = fcLine("humidity");
     chart.options.scales.x.min = now - range * 60000;
     chart.options.scales.x.max = now + d.forecast.horizon * 60000;
     chart.options.plugins.forecastZone.now = now;
@@ -118,22 +102,22 @@
   }
 
   /* ---------- Thẻ số đo, bảng, gợi ý ---------- */
-  function outlook(el, unit, current, end, digits) {
-    if (!end) { el.textContent = "Chưa có dự báo"; return; }
+  function outlook(el, unit, current, end, digits, minutesAhead) {
+    if (end == null) { el.textContent = "Chưa có dự báo"; return; }
     const diff = end - current;
     const dir = Math.abs(diff) < 0.05 * (unit === "%" ? 10 : 1) ? "gần như không đổi"
       : diff > 0 ? `tăng ${num(Math.abs(diff), digits)}${unit === "%" ? " điểm %" : "°C"}`
       : `giảm ${num(Math.abs(diff), digits)}${unit === "%" ? " điểm %" : "°C"}`;
-    el.innerHTML = `Sau 60 phút: <strong>${num(end, digits)}${unit === "%" ? "%" : "°C"}</strong>, ${dir}`;
+    el.innerHTML = `Sau ${minutesAhead} phút: <strong>${num(end, digits)}${unit === "%" ? "%" : "°C"}</strong>, ${dir}`;
   }
 
   function renderReadings(d) {
-    const last = d.forecast.points[d.forecast.points.length - 1];
+    const next = d.forecast.points[0];
     $("#tNow").textContent = d.latest ? num(d.latest.temperature, d.decimals) : "–";
     $("#hNow").textContent = d.latest ? num(d.latest.humidity, d.decimals) : "–";
-    if (d.latest && last) {
-      outlook($("#tOutlook"), "°C", d.latest.temperature, last.temperature, 1);
-      outlook($("#hOutlook"), "%", d.latest.humidity, last.humidity, 0);
+    if (d.latest && next) {
+      outlook($("#tOutlook"), "°C", d.latest.temperature, next.temperature, 1, next.minutes_ahead);
+      outlook($("#hOutlook"), "%", d.latest.humidity, next.humidity, 0, next.minutes_ahead);
     } else {
       $("#tOutlook").textContent = $("#hOutlook").textContent = d.latest ? "Chưa có dự báo" : "Chưa có số liệu";
     }
@@ -143,14 +127,15 @@
     const body = $("#forecastRows");
     if (!d.forecast.points.length) {
       body.innerHTML = '<tr><td colspan="3" class="empty">Chưa có dự báo</td></tr>';
+      body.querySelector(".empty").textContent = d.forecast.error || "Chưa có dự báo";
       $("#modelName").textContent = "";
       return;
     }
     body.innerHTML = d.forecast.points.map((p) => `
       <tr>
-        <th scope="row">${p.minutes_ahead} phút</th>
-        <td>${num(p.temperature)}°C<span class="range">${num(p.temp_low)} – ${num(p.temp_high)}</span></td>
-        <td>${num(p.humidity, 0)}%<span class="range">${num(p.hum_low, 0)} – ${num(p.hum_high, 0)}</span></td>
+        <th scope="row">Sau ${p.hours_ahead} giờ</th>
+        <td>${num(p.temperature)}°C</td>
+        <td>${num(p.humidity, 0)}%</td>
       </tr>`).join("");
     $("#modelName").textContent = "Mô hình: " + d.forecast.model;
   }

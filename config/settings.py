@@ -9,8 +9,10 @@ https://docs.djangoproject.com/en/6.1/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
-
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,14 +21,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-huoi^v!42d)+#47iw2m^szir^&@9086408q9e+1#l_mhc+@*64'
-
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes"}
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DEBUG is disabled.")
+    SECRET_KEY = "django-insecure-local-development-only"
+AI_SERVICE_URL = os.environ.get("AI_SERVICE_URL", "http://localhost:8001")
 
 # Cho phép ESP32 trong mạng LAN gọi tới máy bạn. Chỉ dùng khi phát triển; khi triển khai thật hãy liệt kê host cụ thể.
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if host.strip()
+]
 
 
 # Application definition
@@ -38,11 +47,12 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'monitor',
+    'monitor'
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -116,7 +126,16 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 
 # Email
@@ -132,15 +151,11 @@ MAILERS = {
 # ---------------------------------------------------------------
 # Cấu hình riêng cho đồ án
 # ---------------------------------------------------------------
-import os
 
 LOCATION_NAME = "Phòng kính số 1"          # tên hiển thị trên giao diện
 
 # Khoá API mà ESP32 gửi kèm (header X-API-Key) khi POST dữ liệu lên /api/ingest/
-INGEST_API_KEY = os.environ.get("INGEST_API_KEY", "doi-khoa-nay")
-
-# Lớp dự báo đang dùng. Đổi sang lớp AI của bạn khi đã chọn xong mô hình.
-FORECASTER_CLASS = "monitor.forecasting.TrendForecaster"
+INGEST_API_KEY = os.environ.get("INGEST_API_KEY", "test-api-key")
 
 # Ngưỡng dùng để sinh gợi ý (chỉnh theo loại phòng/cây trồng)
 THRESHOLDS = {
@@ -151,9 +166,8 @@ THRESHOLDS = {
 }
 
 # Loại cảm biến đang dùng. Quyết định số chữ số thập phân hiển thị và độ nhiễu tối thiểu của dự báo.
-# DHT11 chỉ cho số nguyên (sai số khoảng ±2°C, ±5%), nên hiển thị số lẻ sẽ gây hiểu nhầm là chính xác.
-SENSOR_TYPE = "DHT11"
+# DHT22 chỉ cho số nguyên (sai số khoảng ±2°C, ±5%), nên hiển thị số lẻ sẽ gây hiểu nhầm là chính xác.
+SENSOR_TYPE = "DHT22"
 SENSOR_PROFILES = {
-    "DHT11": {"decimals": 0, "temp_sd": 0.7, "hum_sd": 2.0},
     "DHT22": {"decimals": 1, "temp_sd": 0.2, "hum_sd": 0.8},
 }

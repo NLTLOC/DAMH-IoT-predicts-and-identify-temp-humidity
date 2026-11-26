@@ -1,0 +1,471 @@
+IOT TEMPERATURE AND HUMIDITY MONITORING PROJECT
+================================================
+
+This guide explains the current project structure, the purpose of each service,
+how data moves through the system, the changes made to connect Django and
+FastAPI, and how to run and troubleshoot the project.
+
+
+1. WHAT THE PROJECT DOES
+------------------------
+
+The project collects temperature and humidity readings, stores them in a
+SQLite database, displays them in a browser dashboard, and asks a separate
+AI service to forecast the next six hours.
+
+The application has two independent Python services:
+
+  Django (the web service)
+    - Serves the dashboard and its JSON APIs.
+    - Receives and validates sensor readings.
+    - Owns the SQLite database.
+    - Exports historical measurements.
+    - Sends recent measurements to FastAPI when a forecast is needed.
+
+  FastAPI (the AI service)
+    - Loads the trained model artifacts.
+    - Converts sensor readings to hourly values.
+    - Fills missing hours as configured.
+    - Produces six hourly temperature and humidity predictions.
+
+The browser talks to Django only. Django talks to FastAPI over HTTP. FastAPI
+does not connect directly to Django's database and is not a Django app.
+
+
+2. COMPLETE DATA PIPELINES
+--------------------------
+
+A. Sensor ingestion and database storage
+
+  ESP32 or another sensor
+      |
+      | POST /api/ingest/
+      | Header: X-API-Key: <configured key>
+      | JSON: {"temperature": 28.5, "humidity": 71.2, "device": "esp32-01"}
+      v
+  Django monitor.views.api_ingest
+      |
+      | Check API key, JSON fields, and value ranges
+      v
+  monitor.models.Reading
+      |
+      v
+  db.sqlite3
+
+The Reading table stores device, temperature, humidity, and the measurement
+time. Temperature must be between -40 and 85 C; humidity must be between 0 and
+100 percent. A successful ingestion returns HTTP 201.
+
+After storing a reading, Django tries to export the previous complete hour.
+An export failure is logged and does not undo the saved measurement.
+
+B. Browser dashboard and forecasting
+
+  Browser loads /
+      |
+      v
+  Django renders monitor/templates/monitor/dashboard.html
+      |
+      +--> dashboard.css styles the page
+      +--> dashboard.js requests /api/dashboard/ every 10 seconds
+                                  |
+                                  v
+                          Django api_dashboard
+                            |           |
+                            |           +--> Read the selected history range
+                            |                for the graph
+                            |
+                            +--> Read up to 24 hours of recent sensor readings
+                                      |
+                                      | POST /forecast
+                                      | JSON readings + fill_with_open_meteo
+                                      v
+                                  FastAPI
+                                      |
+                                      +--> Convert readings into hourly means
+                                      +--> Build a 24-hour input window
+                                      +--> Fill missing hours by interpolation
+                                      |    or Open-Meteo when configured
+                                      +--> Run the LSTM, ARIMA, and
+                                      |    Random Forest ensemble
+                                      +--> Return six hourly predictions
+                                      |
+                                      v
+                          Django adapts the response
+                          to the dashboard's JSON format
+                            |
+                            +--> Build advice using Django thresholds
+                            +--> Return readings, history, forecast, advice
+                                      |
+                                      v
+                          dashboard.js updates the values,
+                          chart, forecast table, and advice
+
+Django sends readings as ISO timestamps with temperature and humidity. The
+FastAPI service averages them into hourly observations. Its model needs 24
+hourly input values and produces six future hourly values. Missing input hours
+can be filled by interpolation and, if necessary, Open-Meteo data. This means
+forecasting can depend on network access to Open-Meteo when the sensor history
+has gaps.
+
+The dashboard offers 1, 3, 6, and 24 hour history ranges. This selection
+controls the graph and export range; Django separately fetches 24 hours for
+the AI request. The forecast response is cached for 60 seconds to avoid
+re-running inference on every 10-second browser refresh. Failed forecasts are
+cached briefly (10 seconds).
+
+FastAPI's raw response contains `predictions`, `alerts`, and `thresholds`.
+Each prediction has a timestamp, temperature, humidity, and per-model values.
+Django currently adapts the prediction values for the dashboard; the FastAPI
+`alerts` are not currently displayed. Dashboard forecast points contain:
+
+  t              Unix timestamp in milliseconds for chart placement
+  minutes_ahead  Approximate lead time for the first-prediction summary
+  hours_ahead    Row number used by the six-hour forecast table
+  temperature    Forecast temperature in C
+  humidity       Forecast humidity in percent
+
+The browser's dashboard API also includes `latest`, `history`, `online`,
+`decimals`, `location`, and `advice`. It receives a forecast `error` message
+when the AI response is unavailable or invalid. AI-service alert thresholds
+come from the FastAPI environment variables; the displayed advice is generated
+separately by Django using `THRESHOLDS` in config/settings.py.
+
+C. Data export
+
+  Browser GET /api/export/?minutes=60&format=csv
+                    or format=json
+      |
+      v
+  Django monitor.views.api_export
+      |
+      v
+  monitor.exports queries the selected time period
+      |
+      +--> CSV download for spreadsheet analysis
+      +--> JSON download with metadata and summary statistics
+
+The management command `python manage.py export_data` can also export a
+specified time period. By default, export files are written under `exports/`.
+
+
+3. PROJECT FILE MAP
+-------------------
+
+Root:
+
+  manage.py
+    Django command-line entry point.
+
+  config/
+    Django settings, root URL routes, ASGI, and WSGI configuration.
+
+  db.sqlite3
+    Local SQLite database. Docker Compose mounts this same file into the web
+    container so container replacement does not discard readings.
+
+  docker-compose.yml
+    Defines the Django web service and the FastAPI AI service, their ports,
+    networking, health check, environment, and database mount.
+
+  PROJECT_GUIDE.txt
+    This guide.
+
+Django app (`monitor/`):
+
+  models.py
+    Defines the Reading database model.
+
+  views.py
+    Dashboard page, dashboard JSON API, sensor ingestion API, AI HTTP client,
+    response formatting, and CSV/JSON download endpoint.
+
+  urls.py
+    Maps the dashboard and API paths to the views.
+
+  advice.py
+    Builds simple threshold-based advice from current readings and forecast
+    points.
+
+  exports.py
+    Queries readings and creates CSV/JSON export content and hourly files.
+
+  admin.py
+    Makes Reading records visible in Django Admin.
+
+  migrations/
+    Versioned database schema changes. Keep these files when changing models.
+
+  management/commands/seed_demo.py
+    Creates one day of synthetic readings; optionally keeps generating a new
+    measurement every five seconds.
+
+  management/commands/export_data.py
+    Exports readings for a requested time period.
+
+  templates/monitor/dashboard.html
+    Dashboard page structure.
+
+  static/monitor/css/dashboard.css
+    Dashboard styles and responsive layout.
+
+  static/monitor/js/dashboard.js
+    Fetches Django's dashboard API and renders the chart, measurements, table,
+    status, and advice. Chart.js is loaded from a CDN; the page also loads its
+    font from Google Fonts.
+
+  tests.py
+    Tests the dashboard's forecast response adaptation and the behavior when
+    the AI service is unavailable.
+
+AI service (`ai_service/`):
+
+  app/main.py
+    FastAPI application. Provides GET /health, GET /forecast for a demo, and
+    POST /forecast for sensor readings.
+
+  app/predictor.py
+    Converts readings to hourly values, fills a model input window, loads the
+    artifacts, runs the ensemble, and formats the six-hour forecast.
+
+  models/
+    Trained model and scaler artifacts. These must be present for the AI
+    service to start and serve forecasts.
+
+  requirements.txt
+    Python dependencies for FastAPI and machine-learning inference.
+
+
+4. WHAT CHANGED AND WHY
+-----------------------
+
+The current implementation separates the AI model from Django rather than
+trying to import a local Django forecaster:
+
+  - Django calls FastAPI at AI_SERVICE_URL + "/forecast". This replaces the
+    old local-forecaster call, which no longer matched the project layout.
+
+  - Django sends up to 24 hours of database readings for forecasting. The
+    graph's selected history range no longer accidentally limits the model
+    input to only 1, 3, or 6 hours.
+
+  - Django converts FastAPI's response into the format used by the dashboard.
+    Invalid responses and network errors are logged and surfaced as a
+    forecast-unavailable message rather than causing the dashboard API to
+    fail.
+
+  - The dashboard now displays the AI service's actual six hourly points.
+    The former UI described a 60-minute, 10-minute-step forecast and displayed
+    low/high ranges that the AI service does not return. Those unsupported
+    ranges were removed instead of fabricating confidence values.
+
+  - Advice now consumes the adapted forecast points and describes the
+    six-hour forecast. If the AI service fails, the page reports that rather
+    than claiming conditions are stable based only on the current reading.
+
+  - The AI request timeout is 45 seconds because model inference and filling
+    missing data from Open-Meteo may take longer than a short web request.
+    Successful responses are cached for 60 seconds to reduce repeated model
+    calls from the dashboard's 10-second refresh.
+
+  - Django no longer registers `ai_service` as a Django app. FastAPI is an
+    independent HTTP service with its own dependencies and process.
+
+  - The Django Docker build now uses the repository root as its build context
+    and copies the Django project, settings, and app into the image. Container
+    startup applies migrations before starting Gunicorn.
+
+  - Compose mounts the root `db.sqlite3` into the web container. Django
+    settings read deployment secrets and allowed hosts from environment
+    variables. A production-mode Django start requires DJANGO_SECRET_KEY.
+
+  - Two focused dashboard API tests were added. README setup instructions and
+    service descriptions were updated.
+
+Some current worktree changes are separate from these integration fixes:
+the ESP32 firmware file, the old local monitor/forecasting.py file, and the
+root requirements.txt are currently absent. The AI service has its own
+requirements file; Django dependencies are in monitor/requirements.txt.
+Python bytecode cache deletions are generated-file cleanup, not application
+logic.
+
+
+5. RUNNING LOCALLY
+------------------
+
+Django only:
+
+  1. Create and activate a Python virtual environment.
+  2. Install Django dependencies:
+
+       python -m pip install -r monitor/requirements.txt
+
+  3. Apply migrations:
+
+       python manage.py migrate
+
+  4. Optional: create synthetic readings:
+
+       python manage.py seed_demo --clear
+
+  5. Start Django:
+
+       python manage.py runserver
+
+  The dashboard is at http://127.0.0.1:8000/.
+
+For live synthetic readings, run this in another terminal:
+
+       python manage.py seed_demo --live
+
+The command seeds a day's worth of data before generating new sample
+measurements every five seconds. Stop it with Ctrl+C.
+
+To run FastAPI locally, install ai_service/requirements.txt, ensure all four
+model artifacts are in ai_service/models/, then start it from the ai_service
+directory:
+
+       uvicorn app.main:app --host 127.0.0.1 --port 8001
+
+For local Django-to-FastAPI requests, set:
+
+       AI_SERVICE_URL=http://127.0.0.1:8001
+
+The project uses the existing root db.sqlite3. Do not delete it if its readings
+are important.
+
+
+6. RUNNING WITH DOCKER COMPOSE
+------------------------------
+
+Compose requires a secret when Django runs with DEBUG disabled. Create a
+`.env` file in the repository root and provide values like:
+
+  DJANGO_SECRET_KEY=replace-with-a-private-random-secret
+  DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1
+  INGEST_API_KEY=replace-with-a-private-device-key
+
+Use real, private random values; do not commit `.env` to source control.
+For access from another machine, include the appropriate host or IP in
+DJANGO_ALLOWED_HOSTS.
+
+Start both services:
+
+       docker compose up --build
+
+  Django dashboard/API: http://localhost:8000/
+  FastAPI documentation: http://localhost:8001/docs
+
+Compose waits for the AI service health check before starting the Django web
+service. FastAPI's health check becomes successful after its model artifacts
+load. The Django container runs migrations and then starts Gunicorn. The root
+db.sqlite3 is mounted into the container and remains on the host.
+
+To stop the services, press Ctrl+C, then run `docker compose down`. This does
+not remove the host database file.
+
+
+7. HTTP ENDPOINTS
+-----------------
+
+  GET /
+    Returns the dashboard HTML.
+
+  GET /api/dashboard/?minutes=180
+    Returns the latest measurement, selected historical data, six-hour
+    forecast, sensor status, and advice. Supported minutes are 60, 180, 360,
+    and 1440.
+
+  POST /api/ingest/
+    Adds a sensor measurement. Requires the X-API-Key header and JSON:
+
+       {"temperature": 28.5, "humidity": 71.2, "device": "esp32-01"}
+
+  GET /api/export/?minutes=60&format=csv
+  GET /api/export/?minutes=60&format=json
+    Downloads the selected readings.
+
+  GET /health
+  GET /forecast
+  POST /forecast
+    FastAPI health, demo forecast, and sensor-reading forecast endpoints.
+
+
+8. SETTINGS AND SECURITY
+------------------------
+
+  DJANGO_SECRET_KEY
+    Required when Django DEBUG is false. Use a private random value.
+
+  DJANGO_DEBUG
+    Defaults to true for local development. Compose sets it to false.
+
+  DJANGO_ALLOWED_HOSTS
+    Comma-separated hostnames/IPs accepted by Django.
+
+  INGEST_API_KEY
+    Shared secret expected in the sensor's X-API-Key request header.
+
+  AI_SERVICE_URL
+    Base URL Django uses for FastAPI. Compose sets this to
+    http://ai_service:8001, using Docker's internal service name.
+
+  T_MIN, T_MAX, H_MIN, H_MAX
+    Optional AI service forecast alert thresholds. Django's separate advice
+    thresholds are configured in config/settings.py.
+
+Never use development fallback secrets in a public deployment. Do not expose
+the Django server or sensor ingestion endpoint publicly without configuring
+hosts, secrets, and network protections.
+
+
+9. CHECKS AND TROUBLESHOOTING
+-----------------------------
+
+Run Django checks and tests:
+
+       python manage.py check
+       python manage.py test
+
+Common problems:
+
+  "DJANGO_SECRET_KEY must be set"
+    Set DJANGO_SECRET_KEY in the shell or the root .env file before running
+    Compose with DEBUG disabled.
+
+  The dashboard says the forecast is unavailable
+    Confirm FastAPI is running at AI_SERVICE_URL, check its container logs,
+    and confirm all model files exist under ai_service/models/. FastAPI may
+    also need internet access to retrieve Open-Meteo values when sensor
+    history has missing hours.
+
+  FastAPI fails while loading model artifacts
+    Check that model_lstm.keras, scaler.pkl, random_forest.pkl, and
+    arima_ensemble.pkl are present and compatible with the installed
+    TensorFlow, scikit-learn, statsmodels, and Keras versions.
+
+  The sensor receives HTTP 401
+    Its X-API-Key value does not match INGEST_API_KEY in Django's environment.
+
+  Django rejects a browser or device host
+    Add that hostname/IP to DJANGO_ALLOWED_HOSTS.
+
+  No readings appear
+    Check that POST /api/ingest/ returned HTTP 201, the API key is correct,
+    and migrations have been applied. Use `python manage.py seed_demo` to
+    create test readings.
+
+  SQLite reports a database lock
+    SQLite is suitable for a small project or single-server setup but can
+    contend under concurrent writes. Back up db.sqlite3 before changing
+    database configuration; consider PostgreSQL if the project needs
+    multiple application workers or higher write volume.
+
+The Django tests cover forecast response conversion and AI-service failure
+handling. The FastAPI model startup and actual inference should also be tested
+with the real model artifacts before deployment.
+
+At the time this guide was written, Django system checks passed, both Django
+tests passed, JavaScript syntax validation passed, Compose configuration
+resolved, and the Django web image built successfully. The AI image and model
+inference were not built or run as part of that validation.

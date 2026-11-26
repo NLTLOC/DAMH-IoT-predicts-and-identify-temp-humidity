@@ -1,8 +1,12 @@
 import json
-from datetime import timedelta
+import logging
+import math
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
 
 from django.conf import settings
-import logging
+from django.core.cache import cache
 
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
@@ -12,13 +16,73 @@ from django.views.decorators.http import require_POST
 
 from . import exports
 from .advice import build_advice
-from .forecasting import get_forecaster
 from .models import Reading
 
 logger = logging.getLogger(__name__)
 ALLOWED_RANGES = (60, 180, 360, 1440)
 OFFLINE_AFTER = timedelta(minutes=3)
-HORIZON, STEP = 60, 10
+FORECAST_HORIZON = 360
+FORECAST_CACHE_KEY = "monitor:ai_forecast"
+FORECAST_CACHE_SECONDS = 60
+
+def _fetch_forecast(readings):
+    """Call FastAPI with recent readings. Returns parsed JSON, or None on failure."""
+    payload = {
+        "readings": [
+            {"time": r.created_at.isoformat(), "temperature": r.temperature, "humidity": r.humidity}
+            for r in readings
+        ],
+        "fill_with_open_meteo": True,
+    }
+    req = urllib.request.Request(
+        f"{settings.AI_SERVICE_URL}/forecast",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        logger.exception("AI service call failed")
+        return None
+
+
+def _cached_forecast(readings):
+    missing = object()
+    result = cache.get(FORECAST_CACHE_KEY, missing)
+    if result is not missing:
+        return result
+    result = _fetch_forecast(readings)
+    cache.set(FORECAST_CACHE_KEY, result, FORECAST_CACHE_SECONDS if result else 10)
+    return result
+
+
+def _format_predictions(result, now):
+    if not isinstance(result, dict) or not isinstance(result.get("predictions"), list):
+        raise ValueError("AI service returned an invalid forecast response.")
+
+    points = []
+    for hours_ahead, prediction in enumerate(result["predictions"], start=1):
+        if not isinstance(prediction, dict):
+            raise ValueError("AI service returned an invalid forecast point.")
+        forecast_time = datetime.fromisoformat(prediction["time"])
+        if timezone.is_naive(forecast_time):
+            forecast_time = timezone.make_aware(forecast_time)
+        temperature = float(prediction["temperature"])
+        humidity = float(prediction["humidity"])
+        if not math.isfinite(temperature) or not math.isfinite(humidity) or not 0 <= humidity <= 100:
+            raise ValueError("AI service returned out-of-range forecast values.")
+        points.append({
+            "t": int(forecast_time.timestamp() * 1000),
+            "minutes_ahead": max(1, round((forecast_time - now).total_seconds() / 60)),
+            "hours_ahead": hours_ahead,
+            "temperature": temperature,
+            "humidity": humidity,
+        })
+    if not points:
+        raise ValueError("AI service returned no forecast points.")
+    return points
 
 
 def api_export(request):
@@ -75,20 +139,34 @@ def api_dashboard(request):
         minutes = 180
 
     now = timezone.now()
-    forecaster = get_forecaster()
 
     latest = Reading.objects.first()
     history = list(Reading.objects.filter(created_at__gte=now - timedelta(minutes=minutes)).order_by("created_at"))
-    recent = [r for r in history if r.created_at >= now - timedelta(minutes=forecaster.lookback_minutes)]
-    if len(recent) < len(history) and minutes < forecaster.lookback_minutes:
-        recent = history
-    if not recent and latest:
-        recent = list(Reading.objects.filter(
-            created_at__gte=latest.created_at - timedelta(minutes=forecaster.lookback_minutes)
-        ).order_by("created_at"))
+    forecast_readings = list(
+        Reading.objects.filter(created_at__gte=now - timedelta(hours=24)).order_by("created_at")
+    )
 
     online = bool(latest and now - latest.created_at <= OFFLINE_AFTER)
-    forecast = forecaster.predict(recent, HORIZON, STEP) if recent and online else []
+    ai_result = _cached_forecast(forecast_readings) if forecast_readings and online else None
+    forecast_points = []
+    forecast_error = None
+    if ai_result is not None:
+        try:
+            forecast_points = _format_predictions(ai_result, now)
+        except (KeyError, TypeError, ValueError):
+            logger.exception("AI service returned an invalid forecast")
+            forecast_error = "Dự báo tạm thời không khả dụng."
+    elif online:
+        forecast_error = "Không kết nối được dịch vụ dự báo."
+
+    if online and forecast_error:
+        advice = [{
+            "level": "warn",
+            "title": "Dịch vụ dự báo không khả dụng",
+            "detail": "Chưa thể phân tích 6 giờ tới. Kiểm tra kết nối tới dịch vụ AI.",
+        }]
+    else:
+        advice = build_advice(latest if online else None, forecast_points)
 
     return JsonResponse({
         "now": int(now.timestamp() * 1000),
@@ -103,13 +181,12 @@ def api_dashboard(request):
         },
         "history": _downsample(history, minutes),
         "forecast": {
-            "model": forecaster.name,
-            "horizon": HORIZON,
-            "points": [p.as_dict() for p in forecast],
+            "model": "LSTM + ARIMA + Random Forest",
+            "horizon": FORECAST_HORIZON,
+            "points": forecast_points,
+            "error": forecast_error,
         },
-        "advice": build_advice(latest if online else None, forecast) if online or not latest else [{
-            "level": "warn", "title": "Mất kết nối cảm biến",
-            "detail": "Đã hơn 3 phút chưa nhận số liệu mới nên chưa thể dự báo. Kiểm tra nguồn và Wi-Fi của ESP32."}],
+        "advice": advice,
     })
 
 
